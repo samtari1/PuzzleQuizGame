@@ -1,6 +1,6 @@
 # ICT Industry Escape Challenge
 
-A small classroom game app built with Flask, SQLite, HTML, CSS, and vanilla JavaScript. It uses server-side validation for the recovery code, stores only hashed team access codes, and exposes only finished team names and times to the public scoreboard.
+A small classroom game app built with Flask, SQLite, HTML, CSS, and vanilla JavaScript. It uses server-side validation for the recovery code, encrypts team access codes for instructor review, and exposes only finished team names and times to the public scoreboard.
 
 ## Run locally
 
@@ -16,15 +16,15 @@ Edit the created `.env` and replace the sample `FLASK_SECRET_KEY` and `INSTRUCTO
 ./start.sh
 ```
 
-Open <http://localhost:5000>. Stop the server with **Ctrl+C**. `setup.sh` creates `.venv`, installs the dependencies, creates `.env` if needed, and initializes the SQLite database. `start.sh` loads `.env` and launches the app. The app creates `game.db` on first launch. Set the five-digit recovery code when creating each game session in instructor controls; the app stores only a password hash of it. Keep `FLASK_SECRET_KEY` stable between restarts so instructor sessions remain signed in. The instructor password is read from `INSTRUCTOR_PASSWORD` and is never stored in the database.
+Open <http://localhost:5000>. Stop the server with **Ctrl+C**. `setup.sh` creates `.venv`, installs the dependencies, creates `.env` if needed, and initializes the SQLite database. `start.sh` loads `.env` and launches the app. The app creates `game.db` on first launch. Set a recovery code of 1 to 64 characters when creating each game session in instructor controls; the app stores only a password hash of it. Leading and trailing whitespace is trimmed; capitalization, punctuation, and spaces inside the code are preserved. Keep `FLASK_SECRET_KEY` stable between restarts so instructor sessions remain signed in. `INSTRUCTOR_PASSWORD` seeds the initial instructor login on first startup; after logging in, change it from the instructor page. The app stores only a salted password hash in SQLite.
 
 ## Classroom setup
 
 1. Open `/instructor` and sign in with `INSTRUCTOR_PASSWORD`.
-2. Enter one team name per line, set the five-digit recovery code for the printed puzzles, and create a fresh session. Confirm the reset checkbox. The app replaces the previous session and its results.
-3. Copy or print the one-time access code list and give each code privately to its team. Codes are stored as SHA-256 hashes; after leaving the page, the original codes cannot be retrieved. Create a new session to issue replacements.
+2. Enter one team name per line, set a recovery code (1–64 characters) for the printed puzzles, and edit the final incident question if needed. Create a fresh session and confirm the reset checkbox. The app replaces the previous session and its results. You can change the question later from instructor controls.
+3. Give each team its access code from the instructor-only **Teams and access codes** section. You can revisit or print the list later. Add a team there if needed, or use **Replace code** if a team loses its code; the previous code will stop working. Deleting a team requires confirmation and removes its completion and response data.
 4. Project `/scoreboard` on the classroom display. Teams use `/team` on their own devices.
-5. Start the timer in instructor controls. Teams submit their access code and five-digit recovery code. Incorrect guesses are rate-limited and never appear on the scoreboard.
+5. Start the timer in instructor controls. Teams submit their access code and the recovery code you selected. Incorrect guesses are rate-limited and never appear on the scoreboard.
 6. After success, teams submit their response to the Canvas notice incident prompt. Review or edit responses in instructor controls.
 7. For another class, use **Start over for another class**, enter its team names, and confirm deletion. This removes the prior session, access codes, completion times, and responses.
 
@@ -38,7 +38,7 @@ The included `Procfile` works with hosts that support a Python web process. Inst
 gunicorn --workers 1 --bind 0.0.0.0:${PORT:-5000} app:app
 ```
 
-Configure `INSTRUCTOR_PASSWORD`, a long random `FLASK_SECRET_KEY`, and `APP_ENV=production` as server environment variables. The production setting marks the signed session cookie secure, so serve the app over HTTPS. Set `DATABASE_PATH` to a persistent writable disk path on the host; the default `game.db` is in the app directory and may be ephemeral on some hosts. Use HTTPS through the host's TLS proxy. Keep one Gunicorn worker when using the bundled SQLite database on local disk; use a persistent shared database setup before scaling horizontally. The app does not require paid services.
+Configure `INSTRUCTOR_PASSWORD`, a long random `FLASK_SECRET_KEY`, and `APP_ENV=production` as server environment variables. Keep `FLASK_SECRET_KEY` stable: it protects instructor sessions and encrypts team access codes at rest. The production setting marks the signed session cookie secure, so serve the app over HTTPS. Set `DATABASE_PATH` to a persistent writable disk path on the host; the default `game.db` is in the app directory and may be ephemeral on some hosts. Use HTTPS through the host's TLS proxy. Keep one Gunicorn worker when using the bundled SQLite database on local disk; use a persistent shared database setup before scaling horizontally. The app does not require paid services.
 
 `/healthz` provides a simple health check. `requirements.txt`, `Procfile`, and `.env.example` provide the basic deployment files.
 
@@ -61,7 +61,7 @@ sudo chown ict-escape:ict-escape /var/lib/ict-escape
 sudo git clone --branch main https://github.com/samtari1/PuzzleQuizGame.git /var/www/PuzzleQuizGame
 ```
 
-Create `/etc/ict-escape/ict-escape.env` on the VPS with strong, unique secrets. Run this once; save the generated instructor password securely:
+Create `/etc/ict-escape/ict-escape.env` on the VPS with strong, unique secrets. Run this once; save the generated initial instructor password securely. You can change it in instructor controls after logging in:
 
 ```sh
 sudo sh -c 'cat > /etc/ict-escape/ict-escape.env <<EOF
@@ -73,7 +73,7 @@ EOF'
 sudo chmod 600 /etc/ict-escape/ict-escape.env
 ```
 
-The five-digit recovery code is set in instructor controls whenever you create a session.
+The recovery code (1–64 characters) is set in instructor controls whenever you create a session. Teams must enter the same code, including capitalization, punctuation, and internal spaces.
 
 ### Deploy or update
 
@@ -89,7 +89,7 @@ To fetch changes and preview the commits that would be deployed without changing
 sudo /var/www/PuzzleQuizGame/deploy.sh --dry-run
 ```
 
-The deployment script resets tracked app files to the latest `origin/main`, installs Python requirements, installs/updates the systemd service, and restarts it. It does not include `.env`, the virtual environment, or the database in Git. Keep any manual server configuration in `/etc/ict-escape` and `/var/lib/ict-escape`, outside the checkout.
+The deployment script resets tracked app files to the latest `origin/main`, installs Python requirements, installs/updates the systemd service, and restarts it. It does not include `.env`, the virtual environment, or the database in Git. Keep any manual server configuration in `/etc/ict-escape` and `/var/lib/ict-escape`, outside the checkout. Keep the same `FLASK_SECRET_KEY` in `/etc/ict-escape/ict-escape.env` across deploys so saved team access codes remain readable.
 
 If the GitHub repository is private, configure a read-only deploy key for the VPS root account and create `/etc/ict-escape/deploy.conf` with its SSH clone URL:
 

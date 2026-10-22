@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import base64
 import os
 import secrets
 import sqlite3
@@ -10,6 +11,7 @@ from functools import wraps
 
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
+from cryptography.fernet import Fernet, InvalidToken
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_urlsafe(32)
@@ -19,10 +21,18 @@ DB_PATH = os.environ.get('DATABASE_PATH', os.path.join(os.path.dirname(__file__)
 INSTRUCTOR_PASSWORD = os.environ.get('INSTRUCTOR_PASSWORD', '')
 GUESS_LIMIT = 8
 GUESS_WINDOW = 60
+DEFAULT_INCIDENT_PROMPT = 'Who are the team members on your team?'
+PREVIOUS_DEFAULT_INCIDENT_PROMPT = ('A student receives a message that looks like an official Canvas notice and asks them to verify a password through a link. '
+                                    'What should the student do first, how should they verify the message, and whom should they notify?')
 
 # Serialize check-and-finish operations across threads in this process. SQLite transactions
 # additionally protect the one-success-per-team constraint across workers.
 write_lock = threading.RLock()
+
+
+def access_code_cipher():
+    key = hashlib.sha256(('ict-escape-team-codes:' + app.secret_key).encode('utf-8')).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
 
 
 def connect():
@@ -50,12 +60,27 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
           attempted_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS instructor_auth (
+          id INTEGER PRIMARY KEY CHECK(id=1), password_hash TEXT NOT NULL,
+          session_version TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS attempt_window ON attempts(team_id, attempted_at);
         CREATE INDEX IF NOT EXISTS finished_order ON teams(game_id, finished_at);
         ''')
         columns = {row['name'] for row in db.execute('PRAGMA table_info(games)')}
         if 'recovery_hash' not in columns:
             db.execute('ALTER TABLE games ADD COLUMN recovery_hash TEXT')
+        if 'incident_prompt' not in columns:
+            db.execute('ALTER TABLE games ADD COLUMN incident_prompt TEXT')
+        db.execute('UPDATE games SET incident_prompt=? WHERE incident_prompt IS NULL OR incident_prompt="" OR incident_prompt=?',
+                   (DEFAULT_INCIDENT_PROMPT, PREVIOUS_DEFAULT_INCIDENT_PROMPT))
+        team_columns = {row['name'] for row in db.execute('PRAGMA table_info(teams)')}
+        if 'code_encrypted' not in team_columns:
+            db.execute('ALTER TABLE teams ADD COLUMN code_encrypted TEXT')
+        auth = db.execute('SELECT id FROM instructor_auth WHERE id=1').fetchone()
+        if auth is None and INSTRUCTOR_PASSWORD:
+            db.execute('INSERT INTO instructor_auth(id,password_hash,session_version) VALUES(1,?,?)',
+                       (generate_password_hash(INSTRUCTOR_PASSWORD, method='pbkdf2:sha256'), secrets.token_urlsafe(32)))
 
 
 init_db()
@@ -88,7 +113,13 @@ def team_code_hash(code):
 def instructor_required(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        if not session.get('instructor'):
+        version = session.get('instructor_version')
+        if not version:
+            return redirect(url_for('instructor_login', next=request.path))
+        with connect() as db:
+            auth = db.execute('SELECT session_version FROM instructor_auth WHERE id=1').fetchone()
+        if not auth or not hmac.compare_digest(version, auth['session_version']):
+            session.pop('instructor_version', None)
             return redirect(url_for('instructor_login', next=request.path))
         return fn(*args, **kwargs)
     return wrapped
@@ -168,8 +199,8 @@ def team_entry():
                                 message = 'Too many attempts. Please wait a minute before trying again.'
                             else:
                                 db.execute('INSERT INTO attempts(team_id,attempted_at) VALUES(?,?)', (team['id'], now()))
-                                submitted = ''.join(ch for ch in request.form.get('recovery_code', '') if ch.isdigit())
-                                if len(submitted) == 5 and submitted.isdigit() and game['recovery_hash'] and check_password_hash(game['recovery_hash'], submitted):
+                                submitted = request.form.get('recovery_code', '').strip()
+                                if 1 <= len(submitted) <= 64 and game['recovery_hash'] and check_password_hash(game['recovery_hash'], submitted):
                                     stamp = now()
                                     fresh_game = db.execute('SELECT * FROM games WHERE id=?', (game['id'],)).fetchone()
                                     team_elapsed = elapsed(fresh_game, stamp)
@@ -190,7 +221,7 @@ def team_entry():
                 completed_time = duration_label(team['elapsed'])
         return render_template('team.html', game_ready=True, game_status=game['status'], message=message,
                                success=success, completed_time=completed_time, team=team,
-                               response_saved=response_saved)
+                               response_saved=response_saved, incident_prompt=game['incident_prompt'] or DEFAULT_INCIDENT_PROMPT)
 
 
 @app.route('/team/logout', methods=['POST'])
@@ -201,20 +232,27 @@ def team_logout():
 
 @app.route('/instructor/login', methods=['GET', 'POST'])
 def instructor_login():
-    if not INSTRUCTOR_PASSWORD:
-        return render_template('login.html', error='Set INSTRUCTOR_PASSWORD in your environment before using instructor controls.'), 503
     error = None
     if request.method == 'POST':
-        if hmac.compare_digest(request.form.get('password', ''), INSTRUCTOR_PASSWORD):
-            session['instructor'] = True
+        with connect() as db:
+            auth = db.execute('SELECT password_hash,session_version FROM instructor_auth WHERE id=1').fetchone()
+        if not auth:
+            return render_template('login.html', error='Set INSTRUCTOR_PASSWORD in the server environment, then restart the app to initialize instructor access.'), 503
+        if check_password_hash(auth['password_hash'], request.form.get('password', '')):
+            session['instructor_version'] = auth['session_version']
             return redirect(request.args.get('next') or url_for('instructor'))
         error = 'Password did not match.'
+    elif not INSTRUCTOR_PASSWORD:
+        with connect() as db:
+            auth = db.execute('SELECT id FROM instructor_auth WHERE id=1').fetchone()
+        if not auth:
+            return render_template('login.html', error='Set INSTRUCTOR_PASSWORD in the server environment, then restart the app to initialize instructor access.'), 503
     return render_template('login.html', error=error)
 
 
 @app.route('/instructor/logout', methods=['POST'])
 def instructor_logout():
-    session.pop('instructor', None)
+    session.pop('instructor_version', None)
     return redirect(url_for('instructor_login'))
 
 
@@ -227,7 +265,24 @@ def instructor():
         game = current_game(db)
         if request.method == 'POST':
             action = request.form.get('action')
-            if action == 'new_game':
+            if action == 'change_password':
+                auth = db.execute('SELECT password_hash FROM instructor_auth WHERE id=1').fetchone()
+                current_password = request.form.get('current_password', '')
+                new_password = request.form.get('new_password', '')
+                confirm_password = request.form.get('confirm_password', '')
+                if not auth or not check_password_hash(auth['password_hash'], current_password):
+                    notice = 'Current password is incorrect.'
+                elif len(new_password) < 12:
+                    notice = 'Choose a new password with at least 12 characters.'
+                elif new_password != confirm_password:
+                    notice = 'The new passwords do not match.'
+                else:
+                    new_version = secrets.token_urlsafe(32)
+                    new_hash = generate_password_hash(new_password, method='pbkdf2:sha256')
+                    db.execute('UPDATE instructor_auth SET password_hash=?,session_version=? WHERE id=1', (new_hash, new_version))
+                    session['instructor_version'] = new_version
+                    notice = 'Instructor password changed. Other instructor sessions have been signed out.'
+            elif action == 'new_game':
                 # Starting a new session deletes all previous class data and creates a fresh game.
                 confirmed = request.form.get('confirm_reset') == 'yes'
                 if not confirmed:
@@ -235,17 +290,21 @@ def instructor():
                 else:
                     names = [line.strip()[:40] for line in request.form.get('team_names', '').splitlines() if line.strip()]
                     recovery_code = request.form.get('recovery_code', '').strip()
+                    incident_prompt = request.form.get('incident_prompt', '').strip()[:2000]
                     if not names:
                         notice = 'Enter at least one team name, with one team per line.'
                     elif len(names) > 100 or len(set(name.casefold() for name in names)) != len(names):
                         notice = 'Use up to 100 unique team names.'
-                    elif len(recovery_code) != 5 or not recovery_code.isdigit():
-                        notice = 'Enter a five-digit recovery code for this session.'
+                    elif not recovery_code or len(recovery_code) > 64:
+                        notice = 'Enter a recovery code from 1 to 64 characters.'
+                    elif not incident_prompt:
+                        notice = 'Enter the final incident question.'
                     else:
                         with write_lock:
                             db.execute('BEGIN IMMEDIATE')
                             db.execute('DELETE FROM games')
-                            cur = db.execute("INSERT INTO games(status,created_at,recovery_hash) VALUES('ready',?,?)", (now(), generate_password_hash(recovery_code, method='pbkdf2:sha256')))
+                            cur = db.execute("INSERT INTO games(status,created_at,recovery_hash,incident_prompt) VALUES('ready',?,?,?)",
+                                             (now(), generate_password_hash(recovery_code, method='pbkdf2:sha256'), incident_prompt))
                             gid = cur.lastrowid
                             codes = []
                             for name in names:
@@ -253,12 +312,59 @@ def instructor():
                                 while code in codes:
                                     code = secrets.token_urlsafe(6).replace('-', '').replace('_', '').upper()[:8]
                                 codes.append(code)
-                                db.execute('INSERT INTO teams(game_id,name,code_hash) VALUES(?,?,?)', (gid, name, team_code_hash(code)))
+                                encrypted_code = access_code_cipher().encrypt(code.encode('utf-8')).decode('ascii')
+                                db.execute('INSERT INTO teams(game_id,name,code_hash,code_encrypted) VALUES(?,?,?,?)',
+                                           (gid, name, team_code_hash(code), encrypted_code))
                             db.execute('COMMIT')
                         session['issued_codes'] = list(zip(names, codes))
                         return redirect(url_for('instructor'))
             elif game:
-                if action == 'start' and game['status'] in ('ready', 'paused'):
+                if action == 'update_incident_prompt':
+                    incident_prompt = request.form.get('incident_prompt', '').strip()[:2000]
+                    if not incident_prompt:
+                        notice = 'Enter the final incident question.'
+                    else:
+                        db.execute('UPDATE games SET incident_prompt=? WHERE id=?', (incident_prompt, game['id']))
+                        notice = 'Final incident question updated.'
+                elif action == 'add_team':
+                    name = request.form.get('team_name', '').strip()[:40]
+                    existing = db.execute('SELECT id FROM teams WHERE game_id=? AND name=? COLLATE NOCASE',
+                                          (game['id'], name)).fetchone() if name else None
+                    count = db.execute('SELECT COUNT(*) FROM teams WHERE game_id=?', (game['id'],)).fetchone()[0]
+                    if not name:
+                        notice = 'Enter a team name.'
+                    elif existing:
+                        notice = 'A team with that name already exists in this session.'
+                    elif count >= 100:
+                        notice = 'A session can have up to 100 teams.'
+                    else:
+                        code = secrets.token_urlsafe(6).replace('-', '').replace('_', '').upper()[:8]
+                        encrypted_code = access_code_cipher().encrypt(code.encode('utf-8')).decode('ascii')
+                        db.execute('INSERT INTO teams(game_id,name,code_hash,code_encrypted) VALUES(?,?,?,?)',
+                                   (game['id'], name, team_code_hash(code), encrypted_code))
+                        session['issued_codes'] = [(name, code)]
+                        notice = f"Team {name} was added. Share its access code privately."
+                elif action == 'delete_team':
+                    team_id = request.form.get('team_id', type=int)
+                    team = db.execute('SELECT id,name FROM teams WHERE id=? AND game_id=?', (team_id, game['id'])).fetchone()
+                    if team:
+                        db.execute('DELETE FROM teams WHERE id=? AND game_id=?', (team['id'], game['id']))
+                        notice = f"Team {team['name']} and its completion data were deleted."
+                    else:
+                        notice = 'Team not found in the current session.'
+                elif action == 'regenerate_code':
+                    team_id = request.form.get('team_id', type=int)
+                    team = db.execute('SELECT id,name FROM teams WHERE id=? AND game_id=?', (team_id, game['id'])).fetchone()
+                    if team:
+                        code = secrets.token_urlsafe(6).replace('-', '').replace('_', '').upper()[:8]
+                        encrypted_code = access_code_cipher().encrypt(code.encode('utf-8')).decode('ascii')
+                        db.execute('UPDATE teams SET code_hash=?,code_encrypted=? WHERE id=? AND game_id=?',
+                                   (team_code_hash(code), encrypted_code, team['id'], game['id']))
+                        session['issued_codes'] = [(team['name'], code)]
+                        notice = f"A replacement access code was created for {team['name']}."
+                    else:
+                        notice = 'Team not found in the current session.'
+                elif action == 'start' and game['status'] in ('ready', 'paused'):
                     if game['status'] == 'ready':
                         db.execute("UPDATE games SET status='running',started_at=? WHERE id=?", (now(), game['id']))
                     else:
@@ -280,8 +386,20 @@ def instructor():
             notice = request.args.get('notice')
         game = current_game(db)
         teams = game_data(db, game) if game else []
+        access_codes = []
+        if game:
+            rows = db.execute('SELECT id,name,code_encrypted FROM teams WHERE game_id=? ORDER BY name COLLATE NOCASE',
+                              (game['id'],)).fetchall()
+            for row in rows:
+                code = None
+                if row['code_encrypted']:
+                    try:
+                        code = access_code_cipher().decrypt(row['code_encrypted'].encode('ascii')).decode('utf-8')
+                    except (InvalidToken, UnicodeDecodeError):
+                        code = None
+                access_codes.append({'id': row['id'], 'name': row['name'], 'code': code})
         return render_template('instructor.html', game=game, teams=teams, timer=duration_label(elapsed(game)) if game else '00:00',
-                               notice=notice, issued_codes=issued_codes)
+                               notice=notice, issued_codes=issued_codes, access_codes=access_codes)
 
 
 @app.route('/scoreboard')
