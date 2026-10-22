@@ -1,6 +1,6 @@
 # ICT Industry Escape Challenge
 
-A small classroom game app built with Flask, SQLite, HTML, CSS, and vanilla JavaScript. It uses server-side validation for the recovery code, encrypts team access codes for instructor review, and exposes only finished team names and times to the public scoreboard.
+A small classroom game app built with Flask, SQLite, HTML, CSS, and vanilla JavaScript. Teams answer 25 ICT multiple-choice questions one at a time; correct answers advance them, and answer checking stays on the server. Team access codes are encrypted for instructor review, and the public scoreboard exposes only finished team names and times.
 
 ## Run locally
 
@@ -16,19 +16,19 @@ Edit the created `.env` and replace the sample `FLASK_SECRET_KEY` and `INSTRUCTO
 ./start.sh
 ```
 
-Open <http://localhost:5000>. Stop the server with **Ctrl+C**. `setup.sh` creates `.venv`, installs the dependencies, creates `.env` if needed, and initializes the SQLite database. `start.sh` loads `.env` and launches the app. The app creates `game.db` on first launch. Set a recovery code of 1 to 64 characters when creating each game session in instructor controls; the app stores only a password hash of it. Leading and trailing whitespace is trimmed; capitalization, punctuation, and spaces inside the code are preserved. Keep `FLASK_SECRET_KEY` stable between restarts so instructor sessions remain signed in. `INSTRUCTOR_PASSWORD` seeds the initial instructor login on first startup; after logging in, change it from the instructor page. The app stores only a salted password hash in SQLite.
+Open <http://localhost:5000>. Stop the server with **Ctrl+C**. `setup.sh` creates `.venv`, installs the dependencies, creates `.env` if needed, and initializes the SQLite database. `start.sh` loads `.env` and launches the app. The app creates `game.db` on first launch. Keep `FLASK_SECRET_KEY` stable between restarts so instructor sessions and encrypted team access codes remain valid. `INSTRUCTOR_PASSWORD` seeds the initial instructor login on first startup; after logging in, change it from the instructor page. The app stores only a salted password hash in SQLite.
 
 ## Classroom setup
 
 1. Open `/instructor` and sign in with `INSTRUCTOR_PASSWORD`.
-2. Enter one team name per line, set a recovery code (1–64 characters) for the printed puzzles, and edit the final incident question if needed. Create a fresh session and confirm the reset checkbox. The app replaces the previous session and its results. You can change the question later from instructor controls.
+2. Enter one team name per line and edit the final incident question if needed. Create a fresh session and confirm the reset checkbox. The app replaces the previous session and its results. You can change the question later from instructor controls.
 3. Give each team its access code from the instructor-only **Teams and access codes** section. You can revisit or print the list later. Add a team there if needed, or use **Replace code** if a team loses its code; the previous code will stop working. Deleting a team requires confirmation and removes its completion and response data.
 4. Project `/scoreboard` on the classroom display. Teams use `/team` on their own devices.
-5. Start the timer in instructor controls. Teams submit their access code and the recovery code you selected. Incorrect guesses are rate-limited and never appear on the scoreboard.
+5. Before starting the timer, edit the question bank JSON in instructor controls or upload a JSON file. The instructor page has a downloadable starter bank. Each question uses `title` (optional), `question`, `options` (an array of 2–6 choices), and `answer` (the correct choice letter, such as `"B"`). Start the timer when ready. Teams sign in with their team name and access code, then answer questions one at a time. A correct answer advances to the next question; every incorrect answer adds one minute to that team's completion time. Teams see their live time used and accumulated penalty on their page; attempts remain rate-limited.
 6. After success, teams submit their response to the Canvas notice incident prompt. Review or edit responses in instructor controls.
 7. For another class, use **Start over for another class**, enter its team names, and confirm deletion. This removes the prior session, access codes, completion times, and responses.
 
-The timer starts/resumes and pauses using server timestamps. Completion time is measured from the current session timer; the server timestamp determines the finish order.
+The timer starts/resumes and pauses using server timestamps. A team's completion time is the elapsed session time plus any one-minute penalties; the server timestamp determines the finish order.
 
 ## Deploy
 
@@ -73,7 +73,7 @@ EOF'
 sudo chmod 600 /etc/ict-escape/ict-escape.env
 ```
 
-The recovery code (1–64 characters) is set in instructor controls whenever you create a session. Teams must enter the same code, including capitalization, punctuation, and internal spaces.
+The starter challenge contains 25 multiple-choice questions drawn from the ICT Industry lecture. Teams see one question at a time; each correct answer unlocks the next question. Imported question banks are stored with the game session, and edits are locked after the timer starts. Correct answer choices are checked by the server and are not sent to team pages or the public scoreboard.
 
 ### Deploy or update
 

@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import base64
+import json
 import os
 import secrets
 import sqlite3
@@ -12,11 +13,13 @@ from functools import wraps
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 from cryptography.fernet import Fernet, InvalidToken
+from quiz_data import QUIZ_QUESTIONS
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY') or secrets.token_urlsafe(32)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
                   SESSION_COOKIE_SECURE=os.environ.get('APP_ENV') == 'production')
+app.config['MAX_CONTENT_LENGTH'] = 512 * 1024
 DB_PATH = os.environ.get('DATABASE_PATH', os.path.join(os.path.dirname(__file__), 'game.db'))
 INSTRUCTOR_PASSWORD = os.environ.get('INSTRUCTOR_PASSWORD', '')
 GUESS_LIMIT = 8
@@ -72,11 +75,19 @@ def init_db():
             db.execute('ALTER TABLE games ADD COLUMN recovery_hash TEXT')
         if 'incident_prompt' not in columns:
             db.execute('ALTER TABLE games ADD COLUMN incident_prompt TEXT')
+        if 'questions_json' not in columns:
+            db.execute('ALTER TABLE games ADD COLUMN questions_json TEXT')
         db.execute('UPDATE games SET incident_prompt=? WHERE incident_prompt IS NULL OR incident_prompt="" OR incident_prompt=?',
                    (DEFAULT_INCIDENT_PROMPT, PREVIOUS_DEFAULT_INCIDENT_PROMPT))
+        db.execute('UPDATE games SET questions_json=? WHERE questions_json IS NULL OR questions_json=""',
+                   (json.dumps(QUIZ_QUESTIONS, ensure_ascii=False),))
         team_columns = {row['name'] for row in db.execute('PRAGMA table_info(teams)')}
         if 'code_encrypted' not in team_columns:
             db.execute('ALTER TABLE teams ADD COLUMN code_encrypted TEXT')
+        if 'question_index' not in team_columns:
+            db.execute('ALTER TABLE teams ADD COLUMN question_index INTEGER NOT NULL DEFAULT 0')
+        if 'penalty_seconds' not in team_columns:
+            db.execute('ALTER TABLE teams ADD COLUMN penalty_seconds INTEGER NOT NULL DEFAULT 0')
         auth = db.execute('SELECT id FROM instructor_auth WHERE id=1').fetchone()
         if auth is None and INSTRUCTOR_PASSWORD:
             db.execute('INSERT INTO instructor_auth(id,password_hash,session_version) VALUES(1,?,?)',
@@ -108,6 +119,55 @@ def duration_label(seconds):
 
 def team_code_hash(code):
     return hashlib.sha256(code.encode('utf-8')).hexdigest()
+
+
+def normalize_question_bank(payload):
+    if isinstance(payload, dict):
+        payload = payload.get('questions')
+    if not isinstance(payload, list) or not 1 <= len(payload) <= 100:
+        raise ValueError('The file must contain between 1 and 100 questions.')
+    normalized = []
+    for number, item in enumerate(payload, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f'Question {number} must be an object.')
+        prompt = item.get('question')
+        title = item.get('title') or f'Question {number}'
+        options = item.get('options', item.get('choices'))
+        answer = item.get('answer')
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > 2000:
+            raise ValueError(f'Question {number} needs question text (up to 2,000 characters).')
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 100:
+            raise ValueError(f'Question {number} needs a title (up to 100 characters).')
+        if isinstance(options, dict):
+            labels = sorted(options.keys())
+            if labels != [chr(ord('A') + i) for i in range(len(labels))]:
+                raise ValueError(f'Question {number} choices must be labeled consecutively from A.')
+            options = [options[label] for label in labels]
+        if (not isinstance(options, list) or not 2 <= len(options) <= 6
+                or any(not isinstance(option, str) or not option.strip() or len(option.strip()) > 500 for option in options)):
+            raise ValueError(f'Question {number} needs 2 to 6 non-empty answer choices.')
+        if isinstance(answer, str):
+            answer = ord(answer.strip().upper()) - ord('A') if len(answer.strip()) == 1 else -1
+        if not isinstance(answer, int) or isinstance(answer, bool) or not 0 <= answer < len(options):
+            raise ValueError(f'Question {number} answer must be a choice letter such as A, B, C, or D.')
+        normalized.append({'title': title.strip(), 'question': prompt.strip(),
+                           'options': [option.strip() for option in options], 'answer': answer})
+    return normalized
+
+
+def questions_for_game(game):
+    try:
+        return normalize_question_bank(json.loads(game['questions_json']))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return QUIZ_QUESTIONS
+
+
+def question_bank_for_editor(questions):
+    return {'questions': [
+        {'title': item['title'], 'question': item['question'], 'options': item['options'],
+         'answer': chr(ord('A') + item['answer'])}
+        for item in questions
+    ]}
 
 
 def instructor_required(fn):
@@ -150,84 +210,168 @@ def team_entry():
     success = False
     completed_time = None
     response_saved = False
+    selected_choice = None
     with connect() as db:
         game = current_game(db)
-        if game is None or game['status'] == 'ready':
-            return render_template('team.html', game_ready=False)
+        if game is None:
+            return render_template('team.html', game_ready=False, question_count=0)
+        questions = questions_for_game(game)
         team = None
         if request.method == 'POST':
-            action = request.form.get('action', 'submit')
-            access_code = request.form.get('access_code', '').strip().upper()
-            entered_name = request.form.get('team_name', '').strip()[:40]
+            action = request.form.get('action', 'login')
             if action == 'response':
-                team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?', (session.get('team_id'), game['id'])).fetchone()
+                team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?',
+                                  (session.get('team_id'), game['id'])).fetchone()
                 if not team or not team['finished_at']:
-                    message = 'Unlock the challenge before sending your response.'
+                    message = 'Complete the questions before sending your response.'
                 else:
                     text = request.form.get('response', '').strip()[:2000]
-                    db.execute('UPDATE teams SET response=? WHERE id=? AND game_id=?', (text, team['id'], game['id']))
+                    db.execute('UPDATE teams SET response=? WHERE id=? AND game_id=?',
+                               (text, team['id'], game['id']))
                     response_saved = True
                     success = True
                     completed_time = duration_label(team['elapsed'])
                     message = 'Your response has been saved.'
-            elif len(access_code) < 6 or len(access_code) > 12 or not access_code.isalnum():
-                message = 'Enter the team access code provided by your instructor.'
-            else:
-                team = db.execute('SELECT * FROM teams WHERE game_id=? AND code_hash=?', (game['id'], team_code_hash(access_code))).fetchone()
-                if not team or not hmac.compare_digest(team['name'].casefold(), entered_name.casefold()):
-                    # Keep team identity and access-code checks indistinguishable.
-                    message = 'Team details not recognized.'
-                elif game['status'] != 'running' and not team['finished_at']:
-                    message = 'The instructor has not started the timer yet.'
+            elif action == 'answer':
+                team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?',
+                                  (session.get('team_id'), game['id'])).fetchone()
+                selected_choice = request.form.get('choice', type=int)
+                submitted_question_index = request.form.get('question_index', type=int)
+                if not team:
+                    session.pop('team_id', None)
+                    message = 'Enter your team details to continue.'
                 elif team['finished_at']:
                     success = True
                     completed_time = duration_label(team['elapsed'])
-                    session['team_id'] = team['id']
+                elif game['status'] != 'running':
+                    message = 'The instructor has paused the challenge.'
                 else:
                     with write_lock:
                         db.execute('BEGIN IMMEDIATE')
-                        current = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?', (team['id'], game['id'])).fetchone()
+                        current = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?',
+                                             (team['id'], game['id'])).fetchone()
                         if current['finished_at']:
                             success = True
                             completed_time = duration_label(current['elapsed'])
-                            session['team_id'] = team['id']
+                        elif game['status'] != 'running':
+                            message = 'The instructor has paused the challenge.'
+                        elif submitted_question_index != current['question_index']:
+                            message = 'Your team has moved to a different question. Review the current question below.'
+                            selected_choice = None
                         else:
                             cutoff = now() - GUESS_WINDOW
-                            db.execute('DELETE FROM attempts WHERE team_id=? AND attempted_at<?', (team['id'], cutoff))
-                            count = db.execute('SELECT COUNT(*) FROM attempts WHERE team_id=?', (team['id'],)).fetchone()[0]
+                            db.execute('DELETE FROM attempts WHERE team_id=? AND attempted_at<?',
+                                       (team['id'], cutoff))
+                            count = db.execute('SELECT COUNT(*) FROM attempts WHERE team_id=?',
+                                               (team['id'],)).fetchone()[0]
                             if count >= GUESS_LIMIT:
                                 message = 'Too many attempts. Please wait a minute before trying again.'
                             else:
-                                db.execute('INSERT INTO attempts(team_id,attempted_at) VALUES(?,?)', (team['id'], now()))
-                                submitted = request.form.get('recovery_code', '').strip()
-                                if 1 <= len(submitted) <= 64 and game['recovery_hash'] and check_password_hash(game['recovery_hash'], submitted):
-                                    stamp = now()
-                                    fresh_game = db.execute('SELECT * FROM games WHERE id=?', (game['id'],)).fetchone()
-                                    team_elapsed = elapsed(fresh_game, stamp)
-                                    db.execute('UPDATE teams SET finished_at=?, elapsed=? WHERE id=? AND finished_at IS NULL', (stamp, team_elapsed, team['id']))
-                                    completed_time = duration_label(team_elapsed)
-                                    success = True
-                                    session['team_id'] = team['id']
+                                db.execute('INSERT INTO attempts(team_id,attempted_at) VALUES(?,?)',
+                                           (team['id'], now()))
+                                question_index = current['question_index']
+                                if (0 <= question_index < len(questions)
+                                        and selected_choice == questions[question_index]['answer']):
+                                    next_index = question_index + 1
+                                    if next_index == len(questions):
+                                        stamp = now()
+                                        fresh_game = db.execute('SELECT * FROM games WHERE id=?',
+                                                               (game['id'],)).fetchone()
+                                        penalty = db.execute('SELECT penalty_seconds FROM teams WHERE id=?',
+                                                             (team['id'],)).fetchone()['penalty_seconds']
+                                        team_elapsed = elapsed(fresh_game, stamp) + penalty
+                                        db.execute('UPDATE teams SET question_index=?,finished_at=?,elapsed=? '
+                                                   'WHERE id=? AND finished_at IS NULL',
+                                                   (next_index, stamp, team_elapsed, team['id']))
+                                        success = True
+                                        completed_time = duration_label(team_elapsed)
+                                        message = 'Correct! You completed all questions.'
+                                    else:
+                                        db.execute('UPDATE teams SET question_index=? '
+                                                   'WHERE id=? AND finished_at IS NULL',
+                                                   (next_index, team['id']))
+                                        message = 'Correct! Moving to the next question.'
+                                    selected_choice = None
                                 else:
-                                    message = 'Incorrect—check your answers and try again.'
+                                    db.execute('UPDATE teams SET penalty_seconds=penalty_seconds+60 '
+                                               'WHERE id=? AND finished_at IS NULL', (team['id'],))
+                                    message = 'Incorrect—1 minute added to your time. Try again.'
                         db.execute('COMMIT')
-            # On successful submission, fetch latest row so incident response is displayed.
+                    team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?',
+                                      (team['id'], game['id'])).fetchone()
+                    if team and team['finished_at']:
+                        success = True
+                        if completed_time is None:
+                            completed_time = duration_label(team['elapsed'])
+            else:
+                access_code = request.form.get('access_code', '').strip().upper()
+                entered_name = request.form.get('team_name', '').strip()[:40]
+                if len(access_code) < 6 or len(access_code) > 12 or not access_code.isalnum():
+                    message = 'Enter the team access code provided by your instructor.'
+                else:
+                    team = db.execute('SELECT * FROM teams WHERE game_id=? AND code_hash=?',
+                                      (game['id'], team_code_hash(access_code))).fetchone()
+                    if not team or not hmac.compare_digest(team['name'].casefold(), entered_name.casefold()):
+                        message = 'Team details not recognized.'
+                    else:
+                        session['team_id'] = team['id']
+                        if team['finished_at']:
+                            success = True
+                            completed_time = duration_label(team['elapsed'])
+                        elif game['status'] != 'running':
+                            message = 'Your team is ready. The instructor will start the challenge shortly.'
             if success and team:
-                team = db.execute('SELECT * FROM teams WHERE id=?', (team['id'],)).fetchone()
+                team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?',
+                                  (team['id'], game['id'])).fetchone()
         elif session.get('team_id'):
-            team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?', (session['team_id'], game['id'])).fetchone()
-            if team and team['finished_at']:
+            team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?',
+                              (session['team_id'], game['id'])).fetchone()
+            if not team:
+                session.pop('team_id', None)
+            elif team['finished_at']:
                 success = True
                 completed_time = duration_label(team['elapsed'])
+
+        question = None
+        team_time = None
+        if team and not success and 0 <= team['question_index'] < len(questions):
+            item = questions[team['question_index']]
+            # Never send the correct answer index to the browser.
+            question = {'number': team['question_index'] + 1, 'total': len(questions),
+                        'title': item['title'], 'text': item['question'], 'options': item['options']}
+        if team:
+            team_time = (team['elapsed'] if team['finished_at'] else
+                         elapsed(game) + (team['penalty_seconds'] or 0))
         return render_template('team.html', game_ready=True, game_status=game['status'], message=message,
-                               success=success, completed_time=completed_time, team=team,
-                               response_saved=response_saved, incident_prompt=game['incident_prompt'] or DEFAULT_INCIDENT_PROMPT)
+                               success=success, completed_time=completed_time, team=team, question=question,
+                               selected_choice=selected_choice, response_saved=response_saved,
+                               team_time=duration_label(team_time or 0),
+                               penalty_time=duration_label(team['penalty_seconds'] or 0) if team else '00:00',
+                               question_count=len(questions),
+                               incident_prompt=game['incident_prompt'] or DEFAULT_INCIDENT_PROMPT)
 
 
 @app.route('/team/logout', methods=['POST'])
 def team_logout():
     session.pop('team_id', None)
     return redirect(url_for('team_entry'))
+
+
+@app.route('/api/team-time')
+def team_time_api():
+    team_id = session.get('team_id')
+    if not team_id:
+        return jsonify({'active': False}), 401
+    with connect() as db:
+        game = current_game(db)
+        team = db.execute('SELECT * FROM teams WHERE id=? AND game_id=?',
+                          (team_id, game['id'] if game else -1)).fetchone()
+        if not team:
+            return jsonify({'active': False}), 404
+        used = team['elapsed'] if team['finished_at'] else elapsed(game) + (team['penalty_seconds'] or 0)
+        return jsonify({'active': True, 'status': game['status'],
+                        'used': duration_label(used),
+                        'penalty': duration_label(team['penalty_seconds'] or 0)})
 
 
 @app.route('/instructor/login', methods=['GET', 'POST'])
@@ -289,22 +433,19 @@ def instructor():
                     notice = 'Confirm the reset checkbox to create a fresh session and delete the previous class results.'
                 else:
                     names = [line.strip()[:40] for line in request.form.get('team_names', '').splitlines() if line.strip()]
-                    recovery_code = request.form.get('recovery_code', '').strip()
                     incident_prompt = request.form.get('incident_prompt', '').strip()[:2000]
                     if not names:
                         notice = 'Enter at least one team name, with one team per line.'
                     elif len(names) > 100 or len(set(name.casefold() for name in names)) != len(names):
                         notice = 'Use up to 100 unique team names.'
-                    elif not recovery_code or len(recovery_code) > 64:
-                        notice = 'Enter a recovery code from 1 to 64 characters.'
                     elif not incident_prompt:
                         notice = 'Enter the final incident question.'
                     else:
                         with write_lock:
                             db.execute('BEGIN IMMEDIATE')
                             db.execute('DELETE FROM games')
-                            cur = db.execute("INSERT INTO games(status,created_at,recovery_hash,incident_prompt) VALUES('ready',?,?,?)",
-                                             (now(), generate_password_hash(recovery_code, method='pbkdf2:sha256'), incident_prompt))
+                            cur = db.execute("INSERT INTO games(status,created_at,incident_prompt,questions_json) VALUES('ready',?,?,?)",
+                                             (now(), incident_prompt, json.dumps(QUIZ_QUESTIONS, ensure_ascii=False)))
                             gid = cur.lastrowid
                             codes = []
                             for name in names:
@@ -319,7 +460,23 @@ def instructor():
                         session['issued_codes'] = list(zip(names, codes))
                         return redirect(url_for('instructor'))
             elif game:
-                if action == 'update_incident_prompt':
+                if action == 'update_questions':
+                    if game['status'] != 'ready':
+                        notice = 'Questions can only be changed before the instructor starts the timer.'
+                    else:
+                        question_file = request.files.get('question_file')
+                        try:
+                            if question_file and question_file.filename:
+                                payload = json.loads(question_file.read().decode('utf-8-sig'))
+                            else:
+                                payload = json.loads(request.form.get('questions_json', ''))
+                            question_bank = normalize_question_bank(payload)
+                            db.execute('UPDATE games SET questions_json=? WHERE id=?',
+                                       (json.dumps(question_bank, ensure_ascii=False), game['id']))
+                            notice = f"Saved {len(question_bank)} questions for this session."
+                        except (ValueError, TypeError, UnicodeDecodeError) as error:
+                            notice = f'Questions were not saved: {error}'
+                elif action == 'update_incident_prompt':
                     incident_prompt = request.form.get('incident_prompt', '').strip()[:2000]
                     if not incident_prompt:
                         notice = 'Enter the final incident question.'
@@ -386,6 +543,9 @@ def instructor():
             notice = request.args.get('notice')
         game = current_game(db)
         teams = game_data(db, game) if game else []
+        question_editor_json = json.dumps(
+            question_bank_for_editor(questions_for_game(game)), ensure_ascii=False, indent=2
+        ) if game else ''
         access_codes = []
         if game:
             rows = db.execute('SELECT id,name,code_encrypted FROM teams WHERE game_id=? ORDER BY name COLLATE NOCASE',
@@ -399,7 +559,20 @@ def instructor():
                         code = None
                 access_codes.append({'id': row['id'], 'name': row['name'], 'code': code})
         return render_template('instructor.html', game=game, teams=teams, timer=duration_label(elapsed(game)) if game else '00:00',
-                               notice=notice, issued_codes=issued_codes, access_codes=access_codes)
+                               notice=notice, issued_codes=issued_codes, access_codes=access_codes,
+                               question_editor_json=question_editor_json,
+                               question_count=len(questions_for_game(game)) if game else len(QUIZ_QUESTIONS))
+
+
+@app.route('/instructor/question-template')
+@instructor_required
+def instructor_question_template():
+    payload = question_bank_for_editor(QUIZ_QUESTIONS)
+    return app.response_class(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        mimetype='application/json',
+        headers={'Content-Disposition': 'attachment; filename=ict_industry_questions.json'}
+    )
 
 
 @app.route('/scoreboard')

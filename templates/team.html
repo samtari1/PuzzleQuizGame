@@ -1,27 +1,49 @@
-{% extends 'base.html' %}{% block title %}Team entry · ICT Escape Challenge{% endblock %}
+{% extends 'base.html' %}{% block title %}Team challenge · ICT Escape Challenge{% endblock %}
+{% block body_class %}{% if team and not success %}team-playing{% endif %}{% endblock %}{% block main_class %}team-page{% endblock %}
 {% block content %}
-<section class="hero"><p class="eyebrow">ICT INDUSTRY · ESCAPE CHALLENGE</p><h1>Unlock the incident room.</h1><p>Work through the five printed puzzles with your team. Enter your team access code and the recovery code when you are ready.</p></section>
-{% if not game_ready %}<section class="card narrow"><h2>Game not started yet</h2><p>Your instructor will share a team access code when the challenge is ready.</p></section>
+{% if not team or success %}
+<section class="hero"><p class="eyebrow">ICT INDUSTRY · ESCAPE CHALLENGE</p><h1>Work through the challenge.</h1>{% if game_ready %}<p>Enter your team details, then answer {{ question_count }} questions one at a time. A correct answer moves your team forward.</p>{% else %}<p>Your instructor will share team access codes when the challenge is ready.</p>{% endif %}</section>
+{% endif %}
+{% if not game_ready %}
+<section class="card narrow"><h2>Game not started yet</h2><p>Your instructor will share team access codes when the challenge is ready.</p></section>
 {% else %}
-<section class="card narrow">
-  {% if message %}<div class="notice {% if success %}good{% elif 'Incorrect' in message %}bad{% endif %}" role="status">{{ message }}{% if success %} Your completion time: <strong>{{ completed_time }}</strong>.{% endif %}</div>{% endif %}
+<section class="card narrow {% if team and not success %}team-question-card{% endif %}">
+  {% if message %}{% if 'Incorrect' in message %}<div class="wrong-answer-flash" role="status" aria-live="polite" aria-atomic="true"><span class="wrong-bomb" aria-hidden="true">💣</span><span class="wrong-answer-copy"><strong>Boom! Wrong answer.</strong><span>One minute added to your time. Try again!</span></span><span class="wrong-penalty" aria-hidden="true">+1:00</span></div>{% elif 'Correct' in message %}<div class="correct-answer-flash" role="status" aria-live="polite" aria-atomic="true"><span class="correct-celebration" aria-hidden="true">🎉</span><span class="correct-answer-copy"><strong>{% if success %}Brilliant! Challenge unlocked!{% else %}Nice! Correct answer!{% endif %}</strong><span>{% if success %}You finished in {{ completed_time }}.{% else %}Next question unlocked!{% endif %}</span></span><span class="correct-badge" aria-hidden="true">✓</span></div>{% else %}<div class="notice {% if success %}good{% endif %}" role="status">{{ message }}{% if success %} Your completion time: <strong>{{ completed_time }}</strong>.{% endif %}</div>{% endif %}{% endif %}
   {% if success and team %}
+    <div class="team-time-panel" aria-live="polite"><div><span class="time-label">Time used</span><strong id="team-time">{{ team_time }}</strong></div><div><span class="time-label">Penalty added</span><strong id="team-penalty">{{ penalty_time }}</strong></div></div>
     <div class="success-head"><span class="check">✓</span><div><h2>Challenge unlocked!</h2><p>Completed in <strong>{{ completed_time }}</strong></p></div></div>
     <div class="incident"><p class="eyebrow">FINAL INCIDENT PROMPT</p><h3>{{ incident_prompt }}</h3></div>
     <form method="post" class="stack"><input type="hidden" name="action" value="response">
-      <label for="response">Team response</label><textarea id="response" name="response" rows="5" maxlength="2000" placeholder="Describe your first action, how you would verify the notice, and who you would notify…">{{ team.response }}</textarea><button type="submit" class="button secondary">Save response</button>
+      <label for="response">Team response</label><textarea id="response" name="response" rows="5" maxlength="2000" placeholder="Write your team’s response…">{{ team.response }}</textarea><button type="submit" class="button secondary">Save response</button>
     </form>
     <form method="post" action="/team/logout" class="logout-form"><button type="submit" class="button ghost">Team logout</button></form>
     {% if response_saved %}<p class="saved">Response saved for your instructor.</p>{% endif %}
+  {% elif team %}
+    <div class="section-head"><div><p class="eyebrow">TEAM</p><h2>{{ team.name }}</h2></div>{% if question %}<div class="question-progress" role="group" aria-label="Question progress"><div class="question-progress-label"><span>Question <strong>{{ question.number }}</strong></span><span><strong>{{ question.total }}</strong> total</span></div><progress max="{{ question.total }}" value="{{ question.number }}" aria-label="Question {{ question.number }} of {{ question.total }}"></progress></div>{% endif %}</div>
+    <div class="team-time-panel" aria-live="polite"><div><span class="time-label">Time used</span><strong id="team-time">{{ team_time }}</strong></div><div><span class="time-label">Penalty added</span><strong id="team-penalty">{{ penalty_time }}</strong></div></div>
+    {% if game_status != 'running' %}
+      <p class="notice">{% if game_status == 'paused' %}The instructor has paused the challenge. Your progress is saved.{% else %}You’re ready. The instructor will start the timer shortly.{% endif %}</p>
+    {% elif question %}
+      <section class="incident active-question" id="active-question" role="region" aria-labelledby="active-question-title"><p class="eyebrow">{{ question.title }}</p><h3 id="active-question-title" tabindex="-1">{{ question.text }}</h3></section>
+      <form method="post" class="stack"><input type="hidden" name="action" value="answer"><input type="hidden" name="question_index" value="{{ team.question_index }}">
+        <fieldset class="choice-list"><legend>Choose one answer</legend>
+          {% for option in question.options %}<label class="choice"><input type="radio" name="choice" value="{{ loop.index0 }}" required {% if selected_choice == loop.index0 %}checked{% endif %}><span><strong>{{ 'ABCD'[loop.index0] }}.</strong> {{ option }}</span></label>{% endfor %}
+        </fieldset>
+        <button class="button" type="submit">Submit answer</button>
+      </form>
+    {% else %}
+      <p class="notice">Your progress is saved. Reload this page to continue.</p>
+    {% endif %}
+    <form method="post" action="/team/logout" class="logout-form"><button type="submit" class="button ghost">Team logout</button></form>
   {% else %}
-    {% if game_status != 'running' %}<p class="notice">The instructor has not started the timer yet. You can enter your team details now.</p>{% endif %}
-    <form method="post" class="stack">
+    {% if game_status != 'running' %}<p class="notice">Your team can sign in now. The quiz begins when the instructor starts the timer.</p>{% endif %}
+    <form method="post" class="stack"><input type="hidden" name="action" value="login">
       <label for="team_name">Team name</label><input id="team_name" name="team_name" type="text" maxlength="40" autocomplete="off" placeholder="e.g. The Firewall Five" value="{{ request.form.get('team_name', '') }}" required>
       <label for="access_code">Team access code</label><input id="access_code" name="access_code" type="text" minlength="6" maxlength="12" autocapitalize="characters" autocomplete="off" placeholder="Provided by your instructor" value="{{ request.form.get('access_code', '') }}" required>
-      <label for="recovery_code">Recovery code</label><input id="recovery_code" name="recovery_code" type="text" maxlength="64" autocomplete="off" placeholder="Provided by your instructor" required {% if game_status != 'running' %}disabled{% endif %}>
-      <button class="button" type="submit" {% if game_status != 'running' %}disabled{% endif %}>Submit code</button>
+      <button class="button" type="submit">Enter challenge</button>
     </form>
-    <p class="hint">Only your team’s final successful time is recorded. Incorrect guesses are not displayed.</p>
+    <p class="hint">Your team’s progress is saved between questions. Incorrect answers are not shown on the scoreboard.</p>
   {% endif %}
 </section>{% endif %}
 {% endblock %}
+{% block scripts %}{% if team %}<script src="{{ url_for('static', filename='team.js') }}" defer></script>{% endif %}{% endblock %}
