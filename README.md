@@ -44,18 +44,21 @@ Configure `INSTRUCTOR_PASSWORD`, a long random `FLASK_SECRET_KEY`, and `APP_ENV=
 
 ## Deploy to an Ubuntu VPS
 
-The included `deploy.sh` uploads the current app, installs dependencies, installs/updates the systemd service, and restarts it. The steps below prepare an Ubuntu 22.04+ VPS once; after that, deployments are one command. This setup uses Nginx and Certbot for HTTPS and keeps SQLite on persistent disk.
+`deploy.sh` runs on the VPS. It fetches the latest `main` branch from `https://github.com/samtari1/PuzzleQuizGame`, resets the app checkout to `origin/main`, installs dependencies, and restarts the systemd service. The environment file and SQLite database live outside the checkout.
+
+This setup assumes Ubuntu 22.04 or newer, a domain pointed at the VPS, and SSH access.
 
 ### Prepare the VPS once
 
-Connect over SSH, then install the packages and create the app and data directories:
+Connect over SSH and install the packages and create the app and data directories:
 
 ```sh
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx rsync
-sudo useradd --system --user-group --create-home --home-dir /opt/ict-escape --shell /usr/sbin/nologin ict-escape
+sudo apt install -y git python3 python3-venv python3-pip apache2 certbot python3-certbot-apache
+sudo useradd --system --user-group --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin ict-escape
 sudo mkdir -p /var/lib/ict-escape /etc/ict-escape
 sudo chown ict-escape:ict-escape /var/lib/ict-escape
+sudo git clone --branch main https://github.com/samtari1/PuzzleQuizGame.git /var/www/PuzzleQuizGame
 ```
 
 Create `/etc/ict-escape/ict-escape.env` on the VPS with strong, unique secrets. Run this once; save the generated instructor password securely:
@@ -72,41 +75,42 @@ sudo chmod 600 /etc/ict-escape/ict-escape.env
 
 The five-digit recovery code is set in instructor controls whenever you create a session.
 
-### Deploy or update the app
+### Deploy or update
 
-From the project folder on your computer, run this with your SSH user and VPS host or IP:
-
-```sh
-DEPLOY_HOST=YOUR_SSH_USER@YOUR_VPS ./deploy.sh
-```
-
-The SSH account must have sudo access. To preview the files that would be uploaded, use:
+On the VPS, run:
 
 ```sh
-DEPLOY_HOST=YOUR_SSH_USER@YOUR_VPS ./deploy.sh --dry-run
+sudo /var/www/PuzzleQuizGame/deploy.sh
 ```
 
-The script excludes `.env`, `.venv`, local databases, and cache files. It uploads to `/opt/ict-escape`, installs Python dependencies, preserves `/var/lib/ict-escape/game.db`, and restarts the app service. Make sure your SSH key is set up before running it.
+To fetch changes and preview the commits that would be deployed without changing the checkout or restarting the app:
+
+```sh
+sudo /var/www/PuzzleQuizGame/deploy.sh --dry-run
+```
+
+The deployment script resets tracked app files to the latest `origin/main`, installs Python requirements, installs/updates the systemd service, and restarts it. It does not include `.env`, the virtual environment, or the database in Git. Keep any manual server configuration in `/etc/ict-escape` and `/var/lib/ict-escape`, outside the checkout.
+
+If the GitHub repository is private, configure a read-only deploy key for the VPS root account and create `/etc/ict-escape/deploy.conf` with its SSH clone URL:
+
+```sh
+sudo sh -c 'printf "%s\n" "REPO_URL=git@github.com:samtari1/PuzzleQuizGame.git" > /etc/ict-escape/deploy.conf'
+sudo chmod 600 /etc/ict-escape/deploy.conf
+```
 
 ### Configure the domain and HTTPS once
 
-Point your domain's DNS A record to the VPS IP (and AAAA record too if IPv6 is configured). From the project folder, copy the Nginx example to the VPS:
+At your DNS provider, create an A record with host `puzzle` pointing to your VPS IPv4 address. Add an AAAA record only if the VPS has a working public IPv6 address. Wait for DNS to resolve, then enable Apache's proxy modules and install the virtual host:
 
 ```sh
-scp deploy/nginx-ict-escape.example YOUR_SSH_USER@YOUR_VPS:/tmp/nginx-ict-escape
+sudo a2enmod proxy proxy_http
+sudo cp /var/www/PuzzleQuizGame/deploy/apache-puzzle.example /etc/apache2/sites-available/puzzle-ict-escape.conf
+sudo a2ensite puzzle-ict-escape.conf
+sudo apache2ctl configtest
+sudo systemctl reload apache2
+sudo certbot --apache -d puzzle.dryangai.com
 ```
 
-On the VPS, replace `your-domain.example` with your actual domain, enable the config, and request a certificate:
-
-```sh
-sudo sed 's/your-domain.example/your-real-domain.example/g' /tmp/nginx-ict-escape | sudo tee /etc/nginx/sites-available/ict-escape >/dev/null
-sudo ln -s /etc/nginx/sites-available/ict-escape /etc/nginx/sites-enabled/ict-escape
-sudo nginx -t
-sudo systemctl reload nginx
-sudo certbot --nginx -d your-real-domain.example
-```
-
-Allow inbound TCP ports 80 and 443 in the VPS firewall/security group. After DNS has propagated and HTTPS is active, open `https://your-real-domain.example`. Certbot configures certificate renewal; check it with `sudo certbot renew --dry-run`.
+Allow inbound TCP ports 80 and 443 in the VPS firewall/security group. Apache forwards requests to Gunicorn on `127.0.0.1:8000`. After DNS has propagated and HTTPS is active, open `https://puzzle.dryangai.com`. Certbot configures certificate renewal; check it with `sudo certbot renew --dry-run`.
 
 Check app status and logs with `sudo systemctl status ict-escape` and `sudo journalctl -u ict-escape -f`. Back up `/var/lib/ict-escape/game.db` regularly. Keep one Gunicorn worker while using SQLite on local disk.
-# PuzzleQuizGame

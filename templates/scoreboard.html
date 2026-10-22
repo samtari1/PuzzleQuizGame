@@ -1,0 +1,3 @@
+{% extends 'base.html' %}{% block title %}Live scoreboard · ICT Escape Challenge{% endblock %}{% block content %}
+<section class="scoreboard"><p class="eyebrow">ICT INDUSTRY · ESCAPE CHALLENGE</p><h1>Live scoreboard</h1><div class="score-clock" id="score-timer">00:00</div><p class="status-pill" id="score-status">Connecting…</p><div class="score-card"><div class="score-heading"><span>FINISH ORDER</span><span>TIME</span></div><ol id="score-teams" class="score-list"><li class="empty">Waiting for teams to finish…</li></ol></div><p class="score-foot">Progress updates automatically · Keep collaborating</p></section>
+{% endblock %}{% block scripts %}<script src="{{ url_for('static', filename='scoreboard.js') }}" defer></script>{% endblock %}

@@ -1,0 +1,17 @@
+[Unit]
+Description=ICT Industry Escape Challenge web app
+After=network.target
+
+[Service]
+Type=simple
+User=ict-escape
+Group=ict-escape
+WorkingDirectory=/var/www/PuzzleQuizGame
+EnvironmentFile=/etc/ict-escape/ict-escape.env
+ExecStart=/var/www/PuzzleQuizGame/.venv/bin/gunicorn --workers 1 --bind 127.0.0.1:8000 --access-logfile - --error-logfile - app:app
+Restart=on-failure
+RestartSec=3
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

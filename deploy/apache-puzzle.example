@@ -1,0 +1,10 @@
+<VirtualHost *:80>
+    ServerName puzzle.dryangai.com
+
+    ProxyPreserveHost On
+    ProxyPass        / http://127.0.0.1:8000/
+    ProxyPassReverse / http://127.0.0.1:8000/
+
+    ErrorLog ${APACHE_LOG_DIR}/puzzle-ict-escape-error.log
+    CustomLog ${APACHE_LOG_DIR}/puzzle-ict-escape-access.log combined
+</VirtualHost>

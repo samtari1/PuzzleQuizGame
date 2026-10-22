@@ -1,0 +1,4 @@
+{% extends 'base.html' %}{% block title %}Instructor sign in{% endblock %}{% block content %}
+<section class="hero compact"><p class="eyebrow">INSTRUCTOR CONTROLS</p><h1>Sign in to manage the game.</h1></section>
+<section class="card narrow"><form method="post" class="stack"><label for="password">Instructor password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button class="button" type="submit">Sign in</button></form>{% if error %}<p class="notice bad">{{ error }}</p>{% endif %}</section>
+{% endblock %}
